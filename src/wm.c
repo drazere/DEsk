@@ -20267,21 +20267,36 @@ static void layer_surface_arrange(struct desk_layer_surface *ls)
 
 /* Visibility is handled by wlr_scene_layer_surface_v1 itself; only
  * keyboard focus needs doing here. "on-demand" is treated the same as
- * "exclusive" (grab on map) -- true click-to-focus is not implemented,
- * which matters only for a layer client that wants it and is not what
- * a barrier surface (keyboard_interactive = none) asks for anyway. */
+ * "exclusive" (grab on map/commit) -- true click-to-focus is not
+ * implemented, which matters only for a layer client that wants it.
+ *
+ * A barrier surface maps with keyboard_interactive = none (it is just
+ * sitting on the edge) and only asks for it later, with a plain commit
+ * once the barrier is actually crossed -- so this has to run on every
+ * commit, not just the map, or a client that raises its interactivity
+ * after the fact never gets focus and every key it is sent goes nowhere. */
+static void layer_surface_sync_keyboard(struct desk_layer_surface *ls)
+{
+	struct wlr_layer_surface_v1 *surface = ls->layer_surface;
+	struct wlr_seat *seat = ls->server->seat;
+	bool wants = surface->surface->mapped && surface->current.keyboard_interactive
+		!= ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE;
+	bool has = seat->keyboard_state.focused_surface == surface->surface;
+	if (wants && !has) {
+		struct wlr_keyboard *keyboard = wlr_seat_get_keyboard(seat);
+		wlr_seat_keyboard_notify_enter(seat, surface->surface,
+			keyboard ? keyboard->keycodes : NULL, keyboard ? keyboard->num_keycodes : 0,
+			keyboard ? &keyboard->modifiers : NULL);
+	} else if (!wants && has) {
+		wlr_seat_keyboard_notify_clear_focus(seat);
+	}
+}
+
 static void layer_surface_map(struct wl_listener *listener, void *data)
 {
 	(void)data;
 	struct desk_layer_surface *ls = wl_container_of(listener, ls, map);
-	struct wlr_layer_surface_v1 *surface = ls->layer_surface;
-	if (surface->current.keyboard_interactive == ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE) {
-		return;
-	}
-	struct wlr_keyboard *keyboard = wlr_seat_get_keyboard(ls->server->seat);
-	wlr_seat_keyboard_notify_enter(ls->server->seat, surface->surface,
-		keyboard ? keyboard->keycodes : NULL, keyboard ? keyboard->num_keycodes : 0,
-		keyboard ? &keyboard->modifiers : NULL);
+	layer_surface_sync_keyboard(ls);
 }
 
 static void layer_surface_unmap(struct wl_listener *listener, void *data)
@@ -20302,6 +20317,7 @@ static void layer_surface_commit(struct wl_listener *listener, void *data)
 	(void)data;
 	struct desk_layer_surface *ls = wl_container_of(listener, ls, surface_commit);
 	layer_surface_arrange(ls);
+	layer_surface_sync_keyboard(ls);
 }
 
 static void layer_surface_destroy(struct wl_listener *listener, void *data)
