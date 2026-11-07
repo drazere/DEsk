@@ -14566,9 +14566,10 @@ static void post_changed(void *data)
 #endif
 
 /* The desk is a different size now. Everything that was built for the old
- * one goes, the room starts baking again for the new one, and until it
- * lands the desk paints flat -- the same as a first run, because that is
- * what it is. */
+ * one goes, and the room starts baking again for the new one -- but
+ * room_for() keeps the old room (a crop, not a stretch, past a certain
+ * size difference) up as a stand-in until the new one lands, so this is
+ * not the bare plank a first run at a size nobody has opened before is. */
 static void desk_relayout(struct desk_server *server)
 {
 	int w = server->desk_w, h = server->desk_h;
