@@ -20198,7 +20198,21 @@ static void server_new_virtual_pointer(struct wl_listener *listener, void *data)
 {
 	struct desk_server *server = wl_container_of(listener, server, new_virtual_pointer);
 	struct wlr_virtual_pointer_v1_new_pointer_event *event = data;
-	server_new_pointer(server, &event->new_pointer->pointer.base);
+	struct wlr_input_device *device = &event->new_pointer->pointer.base;
+	server_new_pointer(server, device);
+	/* the client named which output it means (input_map_to_output only
+	 * matches a device's own output_name, which a virtual pointer never
+	 * sets): without this, an absolute motion lands against the whole
+	 * cursor layout instead of the one output, and can jump to the far
+	 * edge of a neighbouring one */
+	if (event->suggested_output) {
+		wlr_cursor_map_input_to_output(server->cursor, device, event->suggested_output);
+	}
+	uint32_t caps = WL_SEAT_CAPABILITY_POINTER;
+	if (!wl_list_empty(&server->keyboards)) {
+		caps |= WL_SEAT_CAPABILITY_KEYBOARD;
+	}
+	wlr_seat_set_capabilities(server->seat, caps);
 }
 
 /* Same idea for a virtual keyboard (zwp_virtual_keyboard_manager_v1). */
@@ -20207,6 +20221,11 @@ static void server_new_virtual_keyboard(struct wl_listener *listener, void *data
 	struct desk_server *server = wl_container_of(listener, server, new_virtual_keyboard);
 	struct wlr_virtual_keyboard_v1 *virtual_keyboard = data;
 	server_new_keyboard(server, &virtual_keyboard->keyboard.base);
+	/* server_new_keyboard doesn't raise WL_SEAT_CAPABILITY_KEYBOARD itself
+	 * (server_new_input does that for a real device): on a machine with no
+	 * physical keyboard, the seat never gained the capability, so clients
+	 * never made a wl_keyboard and every injected key went nowhere */
+	wlr_seat_set_capabilities(server->seat, WL_SEAT_CAPABILITY_POINTER | WL_SEAT_CAPABILITY_KEYBOARD);
 }
 
 /* ---- wlr-layer-shell-v1 ---------------------------------------------
