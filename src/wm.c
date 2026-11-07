@@ -106,6 +106,9 @@
 #include <wlr/types/wlr_pointer.h>
 #include <wlr/types/wlr_pointer_constraints_v1.h>
 #include <wlr/types/wlr_relative_pointer_v1.h>
+#include <wlr/types/wlr_virtual_pointer_v1.h>
+#include <wlr/types/wlr_virtual_keyboard_v1.h>
+#include <wlr/types/wlr_layer_shell_v1.h>
 #include <wlr/util/region.h>
 #include <wlr/types/wlr_touch.h>
 #include <wlr/types/wlr_primary_selection.h>
@@ -375,6 +378,21 @@ struct desk_output {
 	struct wlr_box side_box;
 	unsigned side_room;
 	int side_level;
+};
+
+/* A panel, bar, notification popup, or the InputCapture portal's
+ * screen-edge barrier surface (wlr-layer-shell-v1). Each is arranged
+ * against its own output's full area independently -- exclusive-zone
+ * interaction between several layer surfaces stacked on the same edge
+ * of the same output is not accounted for, which is fine for the
+ * barrier/bar-sized clients this is meant for. Popups anchored to a
+ * layer surface are not supported. */
+struct desk_layer_surface {
+	struct wl_list link; /* desk_server.layer_surfaces */
+	struct desk_server *server;
+	struct wlr_layer_surface_v1 *layer_surface;
+	struct wlr_scene_layer_surface_v1 *scene;
+	struct wl_listener map, unmap, destroy, surface_commit;
 };
 
 /* A program asking for the screen to stay lit (idle-inhibit): a film being
@@ -655,6 +673,12 @@ struct desk_server {
 	struct wlr_relative_pointer_manager_v1 *relative_pointer_manager;
 	struct wlr_pointer_constraints_v1 *pointer_constraints;
 	struct wlr_pointer_constraint_v1 *active_constraint;
+	/* Deskflow/Synergy and other RemoteDesktop-portal KVM tools inject
+	 * input here instead of through a real backend device. */
+	struct wlr_virtual_pointer_manager_v1 *virtual_pointer_manager;
+	struct wl_listener new_virtual_pointer;
+	struct wlr_virtual_keyboard_manager_v1 *virtual_keyboard_manager;
+	struct wl_listener new_virtual_keyboard;
 	/* where a pointer that says where it is (a tablet, a virtual machine's)
 	 * last was, to make its movement from while a game holds it still */
 	double abs_x, abs_y;
@@ -693,6 +717,17 @@ struct desk_server {
 	struct wl_listener start_drag;
 	struct wl_listener drag_icon_gone;
 	struct wlr_scene_tree *layer_drag;
+	/* wlr-layer-shell-v1: panels, bars, and the InputCapture portal's
+	 * screen-edge barrier surfaces. background/bottom sit just above the
+	 * desk's own wallpaper art; top/overlay sit above every window and
+	 * drag icon, but below the lock screen. */
+	struct wlr_layer_shell_v1 *layer_shell;
+	struct wl_listener new_layer_surface;
+	struct wl_list layer_surfaces; /* desk_layer_surface.link */
+	struct wlr_scene_tree *layer_shell_background;
+	struct wlr_scene_tree *layer_shell_bottom;
+	struct wlr_scene_tree *layer_shell_top;
+	struct wlr_scene_tree *layer_shell_overlay;
 	/* a button held down in a program: the pointer stays the program's
 	 * until it is let go (pointer_hold) -- the surface it went down on,
 	 * and the buttons the hand has down, whoever was told of them */
@@ -20156,6 +20191,150 @@ static void server_new_input(struct wl_listener *listener, void *data)
 	wlr_seat_set_capabilities(server->seat, caps);
 }
 
+/* A virtual pointer (zwlr_virtual_pointer_manager_v1), the way a
+ * RemoteDesktop-portal backend injects a KVM peer's mouse, is wired up
+ * exactly like a real one once the client has created it. */
+static void server_new_virtual_pointer(struct wl_listener *listener, void *data)
+{
+	struct desk_server *server = wl_container_of(listener, server, new_virtual_pointer);
+	struct wlr_virtual_pointer_v1_new_pointer_event *event = data;
+	server_new_pointer(server, &event->new_pointer->pointer.base);
+}
+
+/* Same idea for a virtual keyboard (zwp_virtual_keyboard_manager_v1). */
+static void server_new_virtual_keyboard(struct wl_listener *listener, void *data)
+{
+	struct desk_server *server = wl_container_of(listener, server, new_virtual_keyboard);
+	struct wlr_virtual_keyboard_v1 *virtual_keyboard = data;
+	server_new_keyboard(server, &virtual_keyboard->keyboard.base);
+}
+
+/* ---- wlr-layer-shell-v1 ---------------------------------------------
+ * Panels, bars, notification popups, and the InputCapture portal's
+ * screen-edge "barrier" surfaces all arrive this way. See the comment
+ * on struct desk_layer_surface for the scope this covers.
+ */
+
+static struct wlr_scene_tree *layer_shell_tree_for(struct desk_server *server,
+	enum zwlr_layer_shell_v1_layer layer)
+{
+	switch (layer) {
+	case ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND:
+		return server->layer_shell_background;
+	case ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM:
+		return server->layer_shell_bottom;
+	case ZWLR_LAYER_SHELL_V1_LAYER_TOP:
+		return server->layer_shell_top;
+	case ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY:
+	default:
+		return server->layer_shell_overlay;
+	}
+}
+
+/* Positions the surface's scene node per its anchor/margin/exclusive-zone
+ * and sends it a configure with the resulting size -- against its own
+ * output's full area, independently of any other layer surface. */
+static void layer_surface_arrange(struct desk_layer_surface *ls)
+{
+	struct wlr_layer_surface_v1 *surface = ls->layer_surface;
+	if (!surface->output) {
+		return;
+	}
+	struct wlr_box full_area;
+	wlr_output_layout_get_box(ls->server->output_layout, surface->output, &full_area);
+	struct wlr_box usable_area = full_area;
+	wlr_scene_layer_surface_v1_configure(ls->scene, &full_area, &usable_area);
+}
+
+/* Visibility is handled by wlr_scene_layer_surface_v1 itself; only
+ * keyboard focus needs doing here. "on-demand" is treated the same as
+ * "exclusive" (grab on map) -- true click-to-focus is not implemented,
+ * which matters only for a layer client that wants it and is not what
+ * a barrier surface (keyboard_interactive = none) asks for anyway. */
+static void layer_surface_map(struct wl_listener *listener, void *data)
+{
+	(void)data;
+	struct desk_layer_surface *ls = wl_container_of(listener, ls, map);
+	struct wlr_layer_surface_v1 *surface = ls->layer_surface;
+	if (surface->current.keyboard_interactive == ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE) {
+		return;
+	}
+	struct wlr_keyboard *keyboard = wlr_seat_get_keyboard(ls->server->seat);
+	wlr_seat_keyboard_notify_enter(ls->server->seat, surface->surface,
+		keyboard ? keyboard->keycodes : NULL, keyboard ? keyboard->num_keycodes : 0,
+		keyboard ? &keyboard->modifiers : NULL);
+}
+
+static void layer_surface_unmap(struct wl_listener *listener, void *data)
+{
+	(void)data;
+	struct desk_layer_surface *ls = wl_container_of(listener, ls, unmap);
+	struct wlr_seat *seat = ls->server->seat;
+	if (seat->keyboard_state.focused_surface == ls->layer_surface->surface) {
+		wlr_seat_keyboard_notify_clear_focus(seat);
+	}
+}
+
+/* Anchor, margin, exclusive-zone, size or layer changed: re-arrange.
+ * (The layer is only honoured at creation time -- a client changing it
+ * after the fact will not be reparented to the new layer's tree.) */
+static void layer_surface_commit(struct wl_listener *listener, void *data)
+{
+	(void)data;
+	struct desk_layer_surface *ls = wl_container_of(listener, ls, surface_commit);
+	layer_surface_arrange(ls);
+}
+
+static void layer_surface_destroy(struct wl_listener *listener, void *data)
+{
+	(void)data;
+	struct desk_layer_surface *ls = wl_container_of(listener, ls, destroy);
+	wl_list_remove(&ls->link);
+	wl_list_remove(&ls->map.link);
+	wl_list_remove(&ls->unmap.link);
+	wl_list_remove(&ls->destroy.link);
+	wl_list_remove(&ls->surface_commit.link);
+	free(ls);
+}
+
+static void server_new_layer_surface(struct wl_listener *listener, void *data)
+{
+	struct desk_server *server = wl_container_of(listener, server, new_layer_surface);
+	struct wlr_layer_surface_v1 *surface = data;
+	if (!surface->output) {
+		surface->output = first_output(server);
+	}
+	if (!surface->output) {
+		wlr_layer_surface_v1_destroy(surface);
+		return;
+	}
+	struct wlr_scene_tree *parent = layer_shell_tree_for(server, surface->current.layer);
+	struct desk_layer_surface *ls = calloc(1, sizeof(*ls));
+	if (!ls) {
+		wlr_layer_surface_v1_destroy(surface);
+		return;
+	}
+	ls->scene = wlr_scene_layer_surface_v1_create(parent, surface);
+	if (!ls->scene) {
+		free(ls);
+		wlr_layer_surface_v1_destroy(surface);
+		return;
+	}
+	ls->server = server;
+	ls->layer_surface = surface;
+	surface->data = ls;
+	ls->map.notify = layer_surface_map;
+	wl_signal_add(&surface->surface->events.map, &ls->map);
+	ls->unmap.notify = layer_surface_unmap;
+	wl_signal_add(&surface->surface->events.unmap, &ls->unmap);
+	ls->destroy.notify = layer_surface_destroy;
+	wl_signal_add(&surface->events.destroy, &ls->destroy);
+	ls->surface_commit.notify = layer_surface_commit;
+	wl_signal_add(&surface->surface->events.commit, &ls->surface_commit);
+	wl_list_insert(&server->layer_surfaces, &ls->link);
+	layer_surface_arrange(ls);
+}
+
 /* ---- Game pointer support ------------------------------------------------
  * This intentionally handles only the focused surface. On keyboard focus
  * changes and pointer leave, a lock is relinquished. No game receives raw
@@ -21643,6 +21822,14 @@ static void output_destroy(struct wl_listener *listener, void *data)
 	wl_list_remove(&output->request_state.link);
 	wl_list_remove(&output->destroy.link);
 	wl_list_remove(&output->link);
+	/* a layer-shell client (a panel, a barrier surface) pinned to this
+	 * output has nowhere left to be arranged against */
+	struct desk_layer_surface *ls, *ls_tmp;
+	wl_list_for_each_safe(ls, ls_tmp, &server->layer_surfaces, link) {
+		if (ls->layer_surface->output == output->wlr_output) {
+			wlr_layer_surface_v1_destroy(ls->layer_surface);
+		}
+	}
 	/* on the way out the scene, and the black in it, has gone already */
 	if (output->dark_cover && !server->quitting) {
 		wlr_scene_node_destroy(&output->dark_cover->node);
@@ -23706,6 +23893,10 @@ int main(int argc, char **argv)
 	server.scene_layout = wlr_scene_attach_output_layout(server.scene, server.output_layout);
 	server.layer_side = wlr_scene_tree_create(&server.scene->tree);
 	server.layer_bg = wlr_scene_tree_create(&server.scene->tree);
+	/* wlr-layer-shell-v1 BACKGROUND/BOTTOM: just above the desk's own
+	 * wallpaper art, below everything the desk draws itself */
+	server.layer_shell_background = wlr_scene_tree_create(&server.scene->tree);
+	server.layer_shell_bottom = wlr_scene_tree_create(&server.scene->tree);
 	server.layer_desk = wlr_scene_tree_create(&server.scene->tree);
 	server.layer_folded = wlr_scene_tree_create(&server.scene->tree);
 	server.layer_win = wlr_scene_tree_create(&server.scene->tree);
@@ -23743,6 +23934,11 @@ int main(int argc, char **argv)
 	server.cc_pressed = -1;
 	server.layer_top = wlr_scene_tree_create(&server.scene->tree);
 	server.layer_drag = wlr_scene_tree_create(&server.scene->tree);
+	/* wlr-layer-shell-v1 TOP/OVERLAY: above every window and drag icon,
+	 * but kept below the lock screen so a layer-shell client can't draw
+	 * over it */
+	server.layer_shell_top = wlr_scene_tree_create(&server.scene->tree);
+	server.layer_shell_overlay = wlr_scene_tree_create(&server.scene->tree);
 	/* and over all of it, the front door when the screen is locked */
 	server.layer_lock = wlr_scene_tree_create(&server.scene->tree);
 	wlr_scene_node_set_enabled(&server.layer_lock->node, false);
@@ -23771,6 +23967,13 @@ int main(int argc, char **argv)
 			WLR_SERVER_DECORATION_MANAGER_MODE_SERVER);
 		server.new_kde_deco.notify = server_new_kde_deco;
 		wl_signal_add(&server.kde_deco->events.new_decoration, &server.new_kde_deco);
+	}
+
+	wl_list_init(&server.layer_surfaces);
+	server.layer_shell = wlr_layer_shell_v1_create(server.wl_display, 4);
+	if (server.layer_shell) {
+		server.new_layer_surface.notify = server_new_layer_surface;
+		wl_signal_add(&server.layer_shell->events.new_surface, &server.new_layer_surface);
 	}
 
 	server.cursor = wlr_cursor_create();
@@ -23809,6 +24012,21 @@ int main(int argc, char **argv)
 		server.new_pointer_constraint.notify = desk_new_pointer_constraint;
 		wl_signal_add(&server.pointer_constraints->events.new_constraint,
 			&server.new_pointer_constraint);
+	}
+	/* zwlr_virtual_pointer_manager_v1 / zwp_virtual_keyboard_manager_v1:
+	 * what a RemoteDesktop-portal backend (e.g. for Deskflow/Synergy)
+	 * needs to inject a KVM peer's mouse and keyboard here. */
+	server.virtual_pointer_manager = wlr_virtual_pointer_manager_v1_create(server.wl_display);
+	if (server.virtual_pointer_manager) {
+		server.new_virtual_pointer.notify = server_new_virtual_pointer;
+		wl_signal_add(&server.virtual_pointer_manager->events.new_virtual_pointer,
+			&server.new_virtual_pointer);
+	}
+	server.virtual_keyboard_manager = wlr_virtual_keyboard_manager_v1_create(server.wl_display);
+	if (server.virtual_keyboard_manager) {
+		server.new_virtual_keyboard.notify = server_new_virtual_keyboard;
+		wl_signal_add(&server.virtual_keyboard_manager->events.new_virtual_keyboard,
+			&server.new_virtual_keyboard);
 	}
 	/* text-input: programs typing through the input method, with DEsk
 	 * as the go-between */

@@ -66,6 +66,9 @@ foreach spec : [
   ['wlr-output-management-unstable-v1-protocol.h', 'protocols/wlr-output-management-unstable-v1.xml'],
   ['wlr-output-power-management-unstable-v1-protocol.h',
     'protocols/wlr-output-power-management-unstable-v1.xml'],
+  # same story for wlr_layer_shell_v1.h, which panels/bars and the
+  # InputCapture portal's screen-edge barrier surfaces need.
+  ['wlr-layer-shell-unstable-v1-protocol.h', 'protocols/wlr-layer-shell-unstable-v1.xml'],
 ]
   proto_headers += custom_target(
     spec[0],

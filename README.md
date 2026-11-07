@@ -1,6 +1,22 @@
 **English** | [日本語](README.ja.md)
 
-# DEsk
+# DEsk (drazere's fork)
+
+My own fork of [DEsk](https://github.com/fyzugx/DEsk), fyzugx's ray-traced
+skeuomorphic Wayland desktop. Everything below is upstream's description;
+the one thing this fork adds on top is KVM/remote-input support:
+
+- **`wlr-layer-shell-v1`** -- panels, bars, and the screen-edge barrier
+  surfaces a RemoteDesktop-portal backend needs.
+- **`zwlr_virtual_pointer_manager_v1` / `zwp_virtual_keyboard_manager_v1`**
+  -- lets a KVM tool such as [Deskflow](https://github.com/deskflow/deskflow)
+  (the Synergy/Barrier successor) inject mouse and keyboard input as if it
+  came from a real device, instead of needing its own backend.
+
+This is the compositor side that a patched Deskflow build targets for its
+input-portal backend.
+
+---
 
 **v0.1.5 (BETA)** -- fixes: no more half-second stops every second and a half on some laptops, windows folded on a second screen stay there, screens turned off with a display tool come back on, games made on the whole screen open on it, drags between X11 programs, programs installed while logged in show up in the bookcase, emoji in notifications, and more. See [RELEASE-NOTES.md](RELEASE-NOTES.md).
 
