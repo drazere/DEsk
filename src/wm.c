@@ -167,8 +167,10 @@ enum desk_sheet_phase {
 	SHEET_UNFOLDING,
 };
 
-/* Super+F1..F9, and the last one Super+F10: which desk a window is on.
- * Super+Page_Up/Page_Down step through them, wrapping round. */
+/* Super+1..9, and the last one Super+0: which desk a window is on.
+ * Super+Page_Up/Page_Down step to the next or previous one with anything
+ * on it, wrapping round -- empty desks are not worth stepping through one
+ * at a time, though one is still a key away to put something new on. */
 #define DESK_WORKSPACES 10
 
 /* A window's shadow lives in its own scene node instead of being painted
@@ -16594,7 +16596,7 @@ static void desk_switch_application(struct desk_server *server)
 	}
 }
 
-/* Super+F1..F10, or Super+Page_Up/Page_Down: another desk, with its own
+/* Super+1..0, or Super+Page_Up/Page_Down: another desk, with its own
  * windows. Everything else -- the drawer, the shelf, the console, the
  * post box -- is one, shared, the way a real desk has one set of drawers
  * whichever paper happens to be on top of it.
@@ -16638,6 +16640,40 @@ static void workspace_switch(struct desk_server *server, int ws)
 	focus_next(server);
 	server_schedule_frames(server);
 	wlr_log(WLR_INFO, "workspace: now on %d", ws + 1);
+}
+
+/* Anything on a desk -- even a sheet folded into the drawer, which is
+ * still that desk's, just put away -- is enough to count it as not
+ * empty. */
+static bool workspace_has_window(struct desk_server *server, int ws)
+{
+	struct desk_toplevel *view;
+	wl_list_for_each(view, &server->toplevels, link) {
+		if (view->workspace == ws) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/* Super+Page_Up/Page_Down: the next (or previous) desk with something on
+ * it, wrapping round -- empty desks in between are skipped over rather
+ * than stepped through one at a time. If every other desk is bare, the
+ * one next over is still a step away (not stuck, and not a tour of nine
+ * empty desks either): just the one, not a tour of all of them. Direct
+ * Super+1..0 is unaffected -- asking for a desk by number always goes
+ * there, empty or not, since that is how one gets anything onto it. */
+static void workspace_cycle(struct desk_server *server, int direction)
+{
+	for (int step = 1; step < DESK_WORKSPACES; step++) {
+		int cand = server->workspace + direction * step;
+		cand = ((cand % DESK_WORKSPACES) + DESK_WORKSPACES) % DESK_WORKSPACES;
+		if (workspace_has_window(server, cand)) {
+			workspace_switch(server, cand);
+			return;
+		}
+	}
+	workspace_switch(server, server->workspace + direction);
 }
 
 static bool handle_keybinding(struct desk_server *server, xkb_keysym_t sym, uint32_t mods)
@@ -16797,16 +16833,20 @@ static bool handle_keybinding(struct desk_server *server, xkb_keysym_t sym, uint
 				post_toggle(server);
 			}
 			return true;
-		case XKB_KEY_F1: case XKB_KEY_F2: case XKB_KEY_F3: case XKB_KEY_F4:
-		case XKB_KEY_F5: case XKB_KEY_F6: case XKB_KEY_F7: case XKB_KEY_F8:
-		case XKB_KEY_F9: case XKB_KEY_F10:
-			workspace_switch(server, sym - XKB_KEY_F1);
+		case XKB_KEY_1: case XKB_KEY_2: case XKB_KEY_3: case XKB_KEY_4:
+		case XKB_KEY_5: case XKB_KEY_6: case XKB_KEY_7: case XKB_KEY_8:
+		case XKB_KEY_9:
+			workspace_switch(server, sym - XKB_KEY_1);
+			return true;
+		case XKB_KEY_0:
+			/* the tenth desk, the way the key after 9 is the tenth */
+			workspace_switch(server, 9);
 			return true;
 		case XKB_KEY_Page_Up:
-			workspace_switch(server, server->workspace - 1);
+			workspace_cycle(server, -1);
 			return true;
 		case XKB_KEY_Page_Down:
-			workspace_switch(server, server->workspace + 1);
+			workspace_cycle(server, 1);
 			return true;
 		default:
 			break;
