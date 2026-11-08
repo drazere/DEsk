@@ -167,6 +167,10 @@ enum desk_sheet_phase {
 	SHEET_UNFOLDING,
 };
 
+/* Super+F1..F9, and the last one Super+F10: which desk a window is on.
+ * Super+Page_Up/Page_Down step through them, wrapping round. */
+#define DESK_WORKSPACES 10
+
 /* A window's shadow lives in its own scene node instead of being painted
  * into the chrome. Moving a window then costs one node position update
  * rather than a repaint of the whole frame, which is what lets the shadow
@@ -412,6 +416,7 @@ struct desk_toplevel {
 	struct wl_list link;
 	struct desk_server *server;
 	bool above;      /* kept in front of the other sheets: a picture-in-picture */
+	int workspace;   /* which desk it is on: an index into DESK_WORKSPACES */
 	struct wlr_xdg_toplevel *xdg_toplevel;
 	struct wlr_xwayland_surface *xsurface;
 	struct wlr_scene_tree *scene_tree;
@@ -644,6 +649,13 @@ struct desk_server {
 	struct wl_listener new_xdg_toplevel;
 	struct wl_listener new_xdg_popup;
 	struct wl_list toplevels;
+
+	/* Which of the DESK_WORKSPACES desks is shown: windows elsewhere in
+	 * the list stay mapped (so a game kept running off to one side goes
+	 * on running) but their scene node is disabled, the same as a sheet
+	 * folded into the drawer -- and for the same reason: nothing on a
+	 * desk not in front of you should take the keys or be clicked. */
+	int workspace;
 
 	/* X11 programs: an X server of their own, started the first time one
 	 * connects, whose windows come to us as surfaces like any other */
@@ -3534,6 +3546,8 @@ static void paint_shelf(struct desk_server *server)
 }
 
 static void shelf_toggle(struct desk_server *server);
+static void focus_next(struct desk_server *server);
+static struct desk_toplevel *workspace_top(struct desk_server *server);
 static void lock_request(struct desk_server *server);
 static void paint_lock(struct desk_server *server);
 static bool locked(const struct desk_server *server);
@@ -8098,8 +8112,7 @@ static int end_timer_cb(void *data)
 	if (console_up(server)) {
 		console_toggle(server);
 	}
-	struct desk_toplevel *view = wl_container_of(server->toplevels.next, view, link);
-	focus_toplevel(view);
+	focus_next(server);
 	server_schedule_frames(server);
 	return 0;
 }
@@ -9378,6 +9391,11 @@ static void sheet_begin_unfold(struct desk_server *server, struct desk_sheet *sh
 	if (sheet->phase == SHEET_IDLE) {
 		return;
 	}
+	/* Taken out now, it comes to the desk you are at -- not the one it
+	 * was folded away from, which may not be shown any more. */
+	struct desk_toplevel *owner;
+	owner = wl_container_of(sheet, owner, sheet);
+	owner->workspace = server->workspace;
 	/* in the drawer: out of it, from where it lies there; in the hand:
 	 * let go of first */
 	if (sheet->in_drawer) {
@@ -9780,9 +9798,13 @@ static void base_hand_over(struct desk_server *server, struct desk_base *b)
 {
 	struct desk_toplevel *view = b->view;
 	if (view && view->scene_tree) {
-		wlr_scene_node_set_enabled(&view->scene_tree->node, true);
-		wlr_scene_node_raise_to_top(&view->scene_tree->node);
-		views_above_raise(server);
+		/* revealed, unless its desk is not the one shown: then it waits
+		 * for workspace_switch to show it, same as any other window there */
+		if (view->workspace == server->workspace) {
+			wlr_scene_node_set_enabled(&view->scene_tree->node, true);
+			wlr_scene_node_raise_to_top(&view->scene_tree->node);
+			views_above_raise(server);
+		}
 	}
 	b->state = BASE_GOING;
 	b->at = monotonic_sec();
@@ -12293,12 +12315,31 @@ static void focus_next(struct desk_server *server)
 {
 	struct desk_toplevel *view;
 	wl_list_for_each(view, &server->toplevels, link) {
-		if (view->sheet.phase == SHEET_IDLE && view->scene_tree && view_takes_keys(view)) {
+		if (view->workspace == server->workspace && view->sheet.phase == SHEET_IDLE
+				&& view->scene_tree && view_takes_keys(view)) {
 			focus_toplevel(view);
 			return;
 		}
 	}
 	wlr_seat_keyboard_notify_clear_focus(server->seat);
+}
+
+/* The front window of the desk you are at, for a keybinding that wants
+ * "the window", not caring which one has the keys right now (nothing
+ * may: the shelf or console can be up instead). Never one off on another
+ * desk, which server->toplevels.next could be once more than one is in
+ * play -- nor a sheet folded away, which is the drawer's, not a window's,
+ * to act on. */
+static struct desk_toplevel *workspace_top(struct desk_server *server)
+{
+	struct desk_toplevel *view;
+	wl_list_for_each(view, &server->toplevels, link) {
+		if (view->workspace == server->workspace && view->sheet.phase == SHEET_IDLE
+				&& view->scene_tree && !view->unmanaged) {
+			return view;
+		}
+	}
+	return NULL;
 }
 
 /* The frame's buffer reaches this far past the paper: only far enough
@@ -16537,6 +16578,7 @@ static void desk_switch_application(struct desk_server *server)
 	struct desk_toplevel *next;
 	wl_list_for_each_reverse(next, &server->toplevels, link) {
 		if (next != current && next->scene_tree && !next->unmanaged
+			&& next->workspace == server->workspace
 			&& next->sheet.phase == SHEET_IDLE && view_takes_keys(next)) {
 			if (current && current->fullscreen) {
 				view_set_fullscreen(current, false);
@@ -16550,6 +16592,52 @@ static void desk_switch_application(struct desk_server *server)
 	if (current && current->fullscreen) {
 		view_set_fullscreen(current, false);
 	}
+}
+
+/* Super+F1..F10, or Super+Page_Up/Page_Down: another desk, with its own
+ * windows. Everything else -- the drawer, the shelf, the console, the
+ * post box -- is one, shared, the way a real desk has one set of drawers
+ * whichever paper happens to be on top of it.
+ *
+ * A window keeps the desk it was opened on; switching only changes which
+ * are shown (and which of them, if any, can have the keys), the way a
+ * sheet is hidden under the desk's own cover without being touched. A
+ * sheet mid-fold, parked in the drawer, or still waiting on its paper
+ * (base_of_view BASE_CARRIED/BASE_OPENING) is left alone either way: that
+ * is the drawer's business, not this desk's, and it must stay exactly as
+ * it was or its own animation breaks. */
+static void workspace_switch(struct desk_server *server, int ws)
+{
+	ws = ((ws % DESK_WORKSPACES) + DESK_WORKSPACES) % DESK_WORKSPACES;
+	if (ws == server->workspace) {
+		return;
+	}
+	/* the keys go nowhere while they would go to a window about to be
+	 * put away; workspace_top/focus_next below say where they go next */
+	struct desk_toplevel *was = view_of_surface(server,
+		server->seat->keyboard_state.focused_surface);
+	if (was && was->workspace != ws) {
+		view_set_activated(was, false);
+		wlr_seat_keyboard_notify_clear_focus(server->seat);
+	}
+	server->workspace = ws;
+	struct desk_toplevel *view;
+	wl_list_for_each(view, &server->toplevels, link) {
+		if (view->sheet.phase != SHEET_IDLE) {
+			continue;   /* folding, parked, or unfolding: the drawer's say */
+		}
+		struct desk_base *b = base_of_view(server, view);
+		if (b && (b->state == BASE_CARRIED || b->state == BASE_OPENING)) {
+			continue;   /* its paper is still coming out from behind it */
+		}
+		if (view->scene_tree) {
+			wlr_scene_node_set_enabled(&view->scene_tree->node, view->workspace == ws);
+		}
+	}
+	views_above_raise(server);
+	focus_next(server);
+	server_schedule_frames(server);
+	wlr_log(WLR_INFO, "workspace: now on %d", ws + 1);
 }
 
 static bool handle_keybinding(struct desk_server *server, xkb_keysym_t sym, uint32_t mods)
@@ -16646,12 +16734,13 @@ static bool handle_keybinding(struct desk_server *server, xkb_keysym_t sym, uint
 			lock_request(server);
 			return true;
 		case XKB_KEY_q:
-		case XKB_KEY_Q:
-			if (!wl_list_empty(&server->toplevels)) {
-				struct desk_toplevel *view = wl_container_of(server->toplevels.next, view, link);
+		case XKB_KEY_Q: {
+			struct desk_toplevel *view = workspace_top(server);
+			if (view) {
 				view_close(view);
 			}
 			return true;
+		}
 		case XKB_KEY_Tab:
 			desk_switch_application(server);
 			return true;
@@ -16661,8 +16750,8 @@ static bool handle_keybinding(struct desk_server *server, xkb_keysym_t sym, uint
 			if (!shelf_up(server) && !console_up(server) && !post_up(server)) {
 				struct desk_toplevel *v = view_of_surface(server,
 					server->seat->keyboard_state.focused_surface);
-				if (!v && !wl_list_empty(&server->toplevels)) {
-					v = wl_container_of(server->toplevels.next, v, link);
+				if (!v) {
+					v = workspace_top(server);
 				}
 				if (v && v->scene_tree && v->sheet.phase == SHEET_IDLE && !v->unmanaged) {
 					view_set_fullscreen(v, !v->fullscreen);
@@ -16670,19 +16759,20 @@ static bool handle_keybinding(struct desk_server *server, xkb_keysym_t sym, uint
 			}
 			return true;
 		case XKB_KEY_m:
-		case XKB_KEY_M:
-			if (!wl_list_empty(&server->toplevels)) {
-				struct desk_toplevel *view = view_of_surface(server,
-					server->seat->keyboard_state.focused_surface);
-				if (!view) {
-					view = wl_container_of(server->toplevels.next, view, link);
-				}
+		case XKB_KEY_M: {
+			struct desk_toplevel *view = view_of_surface(server,
+				server->seat->keyboard_state.focused_surface);
+			if (!view) {
+				view = workspace_top(server);
+			}
+			if (view) {
 				if (view->fullscreen) {
 					view_set_fullscreen(view, false);
 				}
 				view_fold_toggle(view);
 			}
 			return true;
+		}
 		case XKB_KEY_d:
 		case XKB_KEY_D:
 			if (!shelf_up(server)) {
@@ -16707,13 +16797,24 @@ static bool handle_keybinding(struct desk_server *server, xkb_keysym_t sym, uint
 				post_toggle(server);
 			}
 			return true;
+		case XKB_KEY_F1: case XKB_KEY_F2: case XKB_KEY_F3: case XKB_KEY_F4:
+		case XKB_KEY_F5: case XKB_KEY_F6: case XKB_KEY_F7: case XKB_KEY_F8:
+		case XKB_KEY_F9: case XKB_KEY_F10:
+			workspace_switch(server, sym - XKB_KEY_F1);
+			return true;
+		case XKB_KEY_Page_Up:
+			workspace_switch(server, server->workspace - 1);
+			return true;
+		case XKB_KEY_Page_Down:
+			workspace_switch(server, server->workspace + 1);
+			return true;
 		default:
 			break;
 		}
 	}
 	if ((mods & WLR_MODIFIER_ALT) && sym == XKB_KEY_F4) {
-		if (!wl_list_empty(&server->toplevels)) {
-			struct desk_toplevel *view = wl_container_of(server->toplevels.next, view, link);
+		struct desk_toplevel *view = workspace_top(server);
+		if (view) {
 			view_close(view);
 		}
 		return true;
@@ -17164,10 +17265,7 @@ static void lock_finish(struct desk_server *server)
 	}
 	/* let in on a day kept: the clock says so */
 	show_for_today(server);
-	if (!wl_list_empty(&server->toplevels)) {
-		struct desk_toplevel *top = wl_container_of(server->toplevels.next, top, link);
-		focus_toplevel(top);
-	}
+	focus_next(server);
 	server_schedule_frames(server);
 	wlr_log(WLR_INFO, "lock: in");
 }
@@ -19576,9 +19674,8 @@ static void cad_reset(struct desk_server *server)
 	desk_relayout(server);
 	if (locked(server)) {
 		paint_lock(server);
-	} else if (!wl_list_empty(&server->toplevels)) {
-		struct desk_toplevel *top = wl_container_of(server->toplevels.next, top, link);
-		focus_toplevel(top);
+	} else {
+		focus_next(server);
 	}
 	desk_sound_play(DESK_SND_PAPER_SETTLE, 0.0, 0.8, 0.0);
 	server_schedule_frames(server);
@@ -22334,7 +22431,11 @@ static void xdg_toplevel_map(struct wl_listener *listener, void *data)
 		cascade_next(toplevel->server, &x, &y);
 	}
 	wlr_scene_node_set_position(&toplevel->scene_tree->node, x, y);
-	wlr_scene_node_set_enabled(&toplevel->scene_tree->node, true);
+	/* It opened on the desk it was asked for (view->workspace, set when
+	 * the toplevel came to us) -- which, a moment later, may not be the
+	 * one shown any more. Shown and given the keys only if it still is. */
+	bool on_shown_desk = toplevel->workspace == toplevel->server->workspace;
+	wlr_scene_node_set_enabled(&toplevel->scene_tree->node, on_shown_desk);
 	/* A client that never asked for our frame draws its own -- a GTK one
 	 * with a header bar does: it is laid on our paper, or left as it is
 	 * (shell.conf) */
@@ -22342,7 +22443,9 @@ static void xdg_toplevel_map(struct wl_listener *listener, void *data)
 	view_repaint_chrome(toplevel);
 	view_sync_shadow(toplevel);
 	view_check_above(toplevel);
-	focus_toplevel(toplevel);
+	if (on_shown_desk) {
+		focus_toplevel(toplevel);
+	}
 	base_after_map(toplevel->server, toplevel);
 	/* asked to be opened out, or for the whole screen, before it was up --
 	 * a game made on the whole screen: too early to be done then
@@ -22553,6 +22656,7 @@ static void server_new_xdg_toplevel(struct wl_listener *listener, void *data)
 	struct wlr_xdg_toplevel *xdg_toplevel = data;
 	struct desk_toplevel *toplevel = calloc(1, sizeof(*toplevel));
 	toplevel->server = server;
+	toplevel->workspace = server->workspace;
 	view_curl_reset(toplevel);
 	toplevel->xdg_toplevel = xdg_toplevel;
 	toplevel->scene_tree = wlr_scene_tree_create(server->layer_win);
@@ -22957,7 +23061,14 @@ static void xview_map(struct wl_listener *listener, void *data)
 		view_set_fullscreen(view, true);
 	}
 	view_check_above(view);
-	focus_toplevel(view);
+	/* a new scene tree is enabled by default; put it away if its desk
+	 * (set when the surface came to us) is not the one shown now */
+	bool on_shown_desk = view->workspace == server->workspace;
+	if (!on_shown_desk) {
+		wlr_scene_node_set_enabled(&view->scene_tree->node, false);
+	} else {
+		focus_toplevel(view);
+	}
 	base_after_map(server, view);
 	wlr_log(WLR_INFO, "an X11 window comes onto the desk: %s (%s) at %d,%d, %dx%d%s",
 		view_title(view), xs->class ? xs->class : "-",
@@ -23253,6 +23364,7 @@ static void server_new_xwayland_surface(struct wl_listener *listener, void *data
 	}
 	view->server = server;
 	view->xsurface = xs;
+	view->workspace = server->workspace;
 	view_curl_reset(view);
 	xs->data = view;
 	struct { struct wl_signal *sig; struct wl_listener *l; wl_notify_func_t fn; } hooks[] = {
